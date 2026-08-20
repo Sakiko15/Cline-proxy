@@ -924,7 +924,12 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := getProxyConfig()
+	// 深拷贝:getProxyConfig 返回共享指针,直接写 map 会与在途请求的无锁读竞争(并发 map 读写崩溃)
+	cfg := *getProxyConfig()
+	cfg.Headers = make(map[string]string, len(cfg.Headers))
+	for k, v := range getProxyConfig().Headers {
+		cfg.Headers[k] = v
+	}
 	changed := false
 
 	if req.Strategy != "" {
@@ -959,7 +964,7 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if changed {
-		setProxyConfig(cfg)
+		setProxyConfig(&cfg)
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{

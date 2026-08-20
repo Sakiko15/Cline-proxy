@@ -279,10 +279,15 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
 	textEmitted := false
-	callEmitted := false
-	var curCallID, curCallName string
-	var curArgs strings.Builder
 	var outText strings.Builder
+	// 并行工具调用按 index 分别累积,避免多 index 交错时参数互相拼接
+	type respToolAcc struct {
+		callID string
+		name   string
+		args   strings.Builder
+		added  bool // output_item.added 是否已发出
+	}
+	pendingTools := map[int]*respToolAcc{}
 
 	reader := bufio.NewReader(upstream.Body)
 	for {
@@ -359,35 +364,45 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 						"delta": r,
 					})
 				}
-				// 工具调用
+				// 工具调用:按 index 分别累积,并行调用各自独立发射
 				if tc, ok := delta["tool_calls"].([]any); ok {
 					for _, c := range tc {
 						cm, ok := c.(map[string]any)
 						if !ok {
 							continue
 						}
+						idx := 0
+						if i, ok := cm["index"].(float64); ok {
+							idx = int(i)
+						}
+						acc, exists := pendingTools[idx]
+						if !exists {
+							acc = &respToolAcc{}
+							pendingTools[idx] = acc
+						}
 						if id, ok := cm["id"].(string); ok && id != "" {
-							curCallID = id
+							acc.callID = id
 						}
 						fn, _ := cm["function"].(map[string]any)
 						if fn != nil {
 							if n, ok := fn["name"].(string); ok && n != "" {
-								curCallName = n
+								acc.name = n
 							}
 							if a, ok := fn["arguments"].(string); ok && a != "" {
-								curArgs.WriteString(a)
+								acc.args.WriteString(a)
 							}
 						}
-						if !callEmitted && curCallName != "" {
-							callEmitted = true
+						if !acc.added && acc.name != "" {
+							acc.added = true
+							oi := idx + 1 // 文本块(若有)占 0,工具按 index 递增,与收尾 done 事件一致
 							s.event("response.output_item.added", map[string]any{
 								"type": "response.output_item.added",
-								"output_index": 1,
+								"output_index": oi,
 								"item": map[string]any{
 									"type": "function_call",
-									"id":   "fc_" + curCallName,
-									"call_id": curCallID,
-									"name": curCallName,
+									"id":   fmt.Sprintf("fc_%s_%d", s.respID, idx),
+									"call_id": acc.callID,
+									"name": acc.name,
 									"arguments": "",
 									"status": "in_progress",
 								},
@@ -408,9 +423,15 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
 	}
-	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+	for idx := 0; idx < len(pendingTools); idx++ {
+		acc, ok := pendingTools[idx]
+		if !ok || !acc.added {
+			continue
+		}
+		itemID := fmt.Sprintf("fc_%s_%d", s.respID, idx)
+		argsStr := acc.args.String()
+		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": itemID, "output_index": idx + 1, "arguments": argsStr})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": idx + 1, "item": map[string]any{"type": "function_call", "id": itemID, "call_id": acc.callID, "name": acc.name, "arguments": argsStr, "status": "completed"}})
 	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",

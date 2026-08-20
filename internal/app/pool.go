@@ -197,16 +197,37 @@ func pickAccount() *Account {
 	return acc
 }
 
+// ponytail: 全局刷新锁,不同账号的刷新互相串行;刷新罕见(数小时一次),账号级锁等刷新频率上来再改
+var tokenRefreshMu sync.Mutex
+
 func ensureAccountToken(acc *Account) (string, error) {
-	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
-		return acc.AccessToken, nil
+	poolMu.Lock()
+	tok, exp := acc.AccessToken, acc.ExpiresAt
+	poolMu.Unlock()
+	if tok != "" && time.Now().UnixMilli() < exp {
+		return tok, nil
+	}
+
+	// 串行化刷新,避免并发请求双重刷新(RFC 轮换下后刷新者 401)
+	tokenRefreshMu.Lock()
+	defer tokenRefreshMu.Unlock()
+
+	// 双重检查:另一请求可能已刷新完成
+	poolMu.Lock()
+	tok, exp = acc.AccessToken, acc.ExpiresAt
+	poolMu.Unlock()
+	if tok != "" && time.Now().UnixMilli() < exp {
+		return tok, nil
 	}
 
 	if err := refreshAccountToken(acc); err != nil {
 		return "", err
 	}
 
-	return acc.AccessToken, nil
+	poolMu.Lock()
+	tok = acc.AccessToken
+	poolMu.Unlock()
+	return tok, nil
 }
 
 func ListAccounts() []*Account {

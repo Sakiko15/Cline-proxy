@@ -134,6 +134,8 @@ func buildZenTransport() *http.Transport {
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
+		// 只等响应头,不截断长流式 body;防止上游接受连接后无响应的永久挂起
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	t.DialContext = zenDialContext
 	// https 走 HTTP/2 + uTLS Chrome 指纹: 完整浏览器指纹(含 h2),避免 Go 原生指纹被 CF 风控
@@ -142,6 +144,8 @@ func buildZenTransport() *http.Transport {
 }
 
 func zenHTTP2Transport() *http2.Transport {
+	// 注:http2.Transport 无 ResponseHeaderTimeout 等价字段,https 挂死防护靠
+	// dialHTTPProxy 的握手 deadline 与调用方 context;外层 Transport 的超时仅覆盖 http:// 直连
 	return &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			raw, err := zenDialContext(ctx, network, addr)
@@ -247,6 +251,8 @@ func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.C
 		cred := base64.StdEncoding.EncodeToString([]byte(u.User.String()))
 		req.Header.Set("Proxy-Authorization", "Basic "+cred)
 	}
+	// 半死代理(接受 TCP 但不回 CONNECT)会永久阻塞 ReadResponse,握手阶段加 deadline
+	rawConn.SetDeadline(time.Now().Add(30 * time.Second))
 	if err := req.Write(rawConn); err != nil {
 		rawConn.Close()
 		return nil, err
@@ -264,5 +270,7 @@ func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.C
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("proxy CONNECT %s: %s %s", u.Host, resp.Status, strings.TrimSpace(string(b)))
 	}
+	// 清除 deadline,不限制隧道数据阶段
+	rawConn.SetDeadline(time.Time{})
 	return rawConn, nil
 }

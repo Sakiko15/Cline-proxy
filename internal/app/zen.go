@@ -380,10 +380,11 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 
 	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 
+	// 先取指针、释放锁、再阻塞发送：持锁发送会在信号量满时与 markZenSuccess/Fail 死锁
 	zenStateMu.Lock()
 	sem := zenSem
-	sem <- struct{}{}
 	zenStateMu.Unlock()
+	sem <- struct{}{}
 	defer func() { <-sem }()
 
 	retries := cfg.Retries
