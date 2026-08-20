@@ -665,6 +665,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	}
 
 	reader := bufio.NewReader(upstream.Body)
+	sawData := false
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -679,6 +680,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		line = strings.TrimRight(line, "\r\n")
 
 		if strings.HasPrefix(line, "data:") {
+			sawData = true
 			payload := strings.TrimSpace(line[5:])
 			if payload == "" || payload == "[DONE]" {
 				w.Write([]byte(line + "\n\n"))
@@ -716,6 +718,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 
 		w.Write([]byte(line + "\n"))
 		flusher.Flush()
+	}
+
+	// 上游 200 但流内没有任何 data 事件：客户端会收到空 body。
+	// 已无法改状态码（200 头已发出），补一条 SSE 错误事件让客户端可感知/重试。
+	if !sawData {
+		w.Write([]byte("data: {\"error\":{\"message\":\"upstream returned empty stream\",\"type\":\"api_error\"}}\n\n"))
+		flusher.Flush()
+		log.Printf("  upstream returned 200 with empty stream, synthesized error event to client")
 	}
 }
 
@@ -768,6 +778,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	)
 
 	reader := bufio.NewReader(upstream.Body)
+	sawData := false
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -778,6 +789,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		line = strings.TrimRight(line, "\r\n")
 
 		if strings.HasPrefix(line, "data:") {
+			sawData = true
 			payload := strings.TrimSpace(line[5:])
 			if payload == "" || payload == "[DONE]" {
 				if err == io.EOF {
@@ -859,6 +871,11 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	if curToolCall != nil {
 		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
 		toolCalls = append(toolCalls, curToolCall)
+	}
+
+	// 上游 200 但流内没有任何 data 事件：聚合结果为空，报错而不是返回空内容
+	if !sawData {
+		return nil, fmt.Errorf("upstream returned empty stream (no data events)")
 	}
 
 	message := map[string]any{
