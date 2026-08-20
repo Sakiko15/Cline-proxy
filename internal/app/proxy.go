@@ -671,6 +671,11 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		if err != nil {
 			if err == io.EOF {
 				if line != "" {
+					// 无换行结尾的尾部 data 行同样计入 sawData,否则被误判为空流补发错误事件
+					line = strings.TrimRight(line, "\r\n")
+					if strings.HasPrefix(line, "data:") {
+						sawData = true
+					}
 					w.Write([]byte(line + "\n"))
 				}
 			}
