@@ -46,6 +46,7 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 }
 
 func registerAdminRoutes(mux *http.ServeMux) {
+	startOAuthSessionCleaner()
 	mux.HandleFunc("/admin/", adminStaticHandler)
 	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
 	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
@@ -306,6 +307,24 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			"userCode":        device.UserCode,
 		},
 	})
+}
+
+// startOAuthSessionCleaner 定时清理已完成的 OAuth session。
+// 前端在 done 后 clearInterval 停止轮询,惰性删除(查询时删)永不触发,必须后台兜底。
+func startOAuthSessionCleaner() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for range ticker.C {
+			cutoff := time.Now().Add(-5 * time.Minute)
+			oauthSessionsMu.Lock()
+			for k, v := range oauthSessions {
+				if v.Done && !v.CompletedAt.IsZero() && v.CompletedAt.Before(cutoff) {
+					delete(oauthSessions, k)
+				}
+			}
+			oauthSessionsMu.Unlock()
+		}
+	}()
 }
 
 // GET /admin/api/oauth/status?sessionId=xxx
