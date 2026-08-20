@@ -171,6 +171,11 @@ func recordZenStats(rec zenStatsRecord) {
 	statsFileMu.Unlock()
 
 	statsAggMu.Lock()
+	// 不依赖每分钟 ticker:日期已变则立即轮换,避免午夜首分钟统计累进昨天被丢弃
+	today := time.Now().Format("2006-01-02")
+	if statsToday.Date != today {
+		statsToday = newZenStatsAgg()
+	}
 	aggregateRecord(statsToday, &rec)
 	aggregateRecord(statsTotal, &rec)
 	statsAggMu.Unlock()
@@ -192,8 +197,22 @@ func zenStatsSnapshot() map[string]any {
 	initStats()
 	statsAggMu.Lock()
 	defer statsAggMu.Unlock()
+	// 深拷贝:返回副本,避免调用方在锁外序列化时与并发累加竞争
 	return map[string]any{
-		"today": statsToday,
-		"total": statsTotal,
+		"today": copyZenStatsAgg(statsToday),
+		"total": copyZenStatsAgg(statsTotal),
 	}
+}
+
+func copyZenStatsAgg(a *zenStatsAgg) *zenStatsAgg {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.ByModel = make(map[string]*zenStatsModel, len(a.ByModel))
+	for k, v := range a.ByModel {
+		vv := *v
+		c.ByModel[k] = &vv
+	}
+	return &c
 }

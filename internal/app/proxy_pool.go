@@ -27,6 +27,8 @@ var (
 
 	zenProxyCooldowns   = map[int]time.Time{} // 代理索引 -> 冷却截止
 	zenProxyCooldownsMu sync.Mutex
+
+	zenLastDialProxy atomic.Int64 // 最近一次实际拨号的代理索引(-1 = 未使用代理)
 )
 
 // cooldownZenProxy 标记某出口代理冷却,冷却期内轮询跳过
@@ -75,6 +77,10 @@ func zenProxyCooldownStatus() map[string]string {
 func rebuildZenTransport() {
 	zenTransportMu.Lock()
 	defer zenTransportMu.Unlock()
+	// 关闭旧 client 的空闲连接池:http2 transport 的 IdleConnTimeout 为零,不关则逐次累积泄漏
+	if old := zenHTTPClient; old != nil {
+		old.CloseIdleConnections()
+	}
 	zenHTTPClient = &http.Client{Transport: buildZenTransport()}
 }
 
@@ -110,13 +116,10 @@ func pickZenProxy() (string, int) {
 	return cfg.Proxies[idx], idx
 }
 
-// lastZenProxyIdx 最近一次选择的代理索引(日志用)
-func lastZenProxyIdx() int {
-	v := int64(zenProxyCount.Load())
-	if v <= 0 {
-		return -1
-	}
-	return int((v - 1) % int64(max(1, len(getZenConfig().Proxies))))
+// lastZenDialProxyIdx 最近一次实际拨号使用的代理索引(冷却/日志用)。
+// 由 zenDialContext 在拨号时原子记录,替代计数反推(后者在 random/fill 策略下冷却错对象)。
+func lastZenDialProxyIdx() int {
+	return int(zenLastDialProxy.Load())
 }
 
 func maskProxyURL(raw string) string {
@@ -171,7 +174,8 @@ func zenHTTP2Transport() *http2.Transport {
 }
 
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	p, _ := pickZenProxy()
+	p, idx := pickZenProxy()
+	zenLastDialProxy.Store(int64(idx))
 	if p == "" {
 		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)

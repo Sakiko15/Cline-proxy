@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -156,14 +157,23 @@ func PollWorkosToken(deviceCode string, interval, expiresIn int) (*authenticateR
 		}
 
 		var a authenticateResp
-		if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("workos poll decode: %w", err)
-		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&a)
 		resp.Body.Close()
 
 		if resp.StatusCode == 200 {
+			if decodeErr != nil {
+				return nil, fmt.Errorf("workos poll: HTTP 200 but decode failed: %w", decodeErr)
+			}
 			return &a, nil
+		}
+
+		// 服务器瞬时故障(429/5xx):RFC 8628 要求退避后继续轮询,只有终止性错误码才中断
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			time.Sleep(time.Duration(currentInterval+5) * time.Second)
+			continue
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("workos poll: HTTP %d (decode failed: %v)", resp.StatusCode, decodeErr)
 		}
 
 		switch a.Error {

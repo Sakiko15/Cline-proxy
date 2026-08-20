@@ -414,11 +414,18 @@ func maybeCompact(params map[string]any, m *ZenModel, sessionID string) compactO
 	}
 
 	// 5. 重组: [原system]+[摘要]+[recent 尾部原始消息]
+	// 跳过旧摘要消息(由下方新摘要 + Previous 状态替代),否则同一摘要单请求出现两份且每轮 +2 条累积
 	var newMsgs []any
 	for _, msg := range messages {
-		if mm, ok := msg.(map[string]any); ok && strField(mm, "role") == "system" {
-			newMsgs = append(newMsgs, mm)
+		mm, ok := msg.(map[string]any)
+		if !ok || strField(mm, "role") != "system" {
+			continue
 		}
+		c := strField(mm, "content")
+		if strings.HasPrefix(c, "[Conversation Summary]") || strings.HasPrefix(c, "[Previous Conversation Summary]") {
+			continue
+		}
+		newMsgs = append(newMsgs, mm)
 	}
 	newMsgs = append(newMsgs, map[string]any{
 		"role":    "system",
@@ -449,7 +456,8 @@ func findExistingSummary(messages []any, upTo int) string {
 	if upTo > len(messages) {
 		upTo = len(messages)
 	}
-	for i := 0; i < upTo; i++ {
+	// 从后往前取最后一个匹配:多轮压缩后历史里可能有多份摘要,锚定最新一份
+	for i := upTo - 1; i >= 0; i-- {
 		mm, ok := messages[i].(map[string]any)
 		if !ok {
 			continue
@@ -500,7 +508,22 @@ func fallbackTruncate(params map[string]any, m *ZenModel) compactOutcome {
 		}
 		t := estimateText(msgText(mm))
 		if used+t > budget {
-			continue
+			// 超预算:截断这条最新消息保留前缀,并停止保留更早的消息
+			// (旧逻辑 continue 跳过最新消息去保留更早的,导致最新上下文丢失甚至无 user 消息)
+			room := budget - used
+			if room > 0 {
+				runes := []rune(msgText(mm))
+				keepRunes := room * 4 // estimateText 按 runes/4 估算
+				if keepRunes >= len(runes) {
+					keepRunes = len(runes)
+				}
+				if keepRunes > 0 {
+					truncated := map[string]any{"role": mm["role"], "content": string(runes[:keepRunes]) + "\n...[truncated]"}
+					kept = append(kept, idxMsg{i, truncated})
+					used += t
+				}
+			}
+			break
 		}
 		kept = append(kept, idxMsg{i, messages[i]})
 		used += t

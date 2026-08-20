@@ -765,6 +765,13 @@ func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Resp
 	writeJSON(w, http.StatusOK, out)
 }
 
+// csToolAcc 聚合流中单个工具调用的累积器(按 index 键控)
+type csToolAcc struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
 func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	var (
 		model        string
@@ -772,9 +779,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		finishReason string
 		usage        map[string]any
 		toolCalls    []any
-		toolCallIdx  = -1
-		curToolCall  map[string]any
-		curArgs      strings.Builder
+		pendingTools = map[int]*csToolAcc{}
 	)
 
 	reader := bufio.NewReader(upstream.Body)
@@ -840,25 +845,21 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 					if i, ok := tcMap["index"].(float64); ok {
 						idx = int(i)
 					}
-					if idx != toolCallIdx {
-						if curToolCall != nil {
-							curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
-							toolCalls = append(toolCalls, curToolCall)
-						}
-						curToolCall = map[string]any{
-							"id":       tcMap["id"],
-							"type":     "function",
-							"function": map[string]any{"name": "", "arguments": ""},
-						}
-						curArgs.Reset()
-						toolCallIdx = idx
+					// 按 index 累积:上游交错推送(index 0→1→0)时不会拆成两条
+					acc, exists := pendingTools[idx]
+					if !exists {
+						acc = &csToolAcc{}
+						pendingTools[idx] = acc
+					}
+					if id, ok := tcMap["id"].(string); ok && id != "" {
+						acc.id = id
 					}
 					if fn, ok := tcMap["function"].(map[string]any); ok {
 						if n, ok := fn["name"].(string); ok && n != "" {
-							curToolCall["function"].(map[string]any)["name"] = n
+							acc.name = n
 						}
 						if a, ok := fn["arguments"].(string); ok && a != "" {
-							curArgs.WriteString(a)
+							acc.args.WriteString(a)
 						}
 					}
 				}
@@ -868,9 +869,16 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 			break
 		}
 	}
-	if curToolCall != nil {
-		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
-		toolCalls = append(toolCalls, curToolCall)
+	for i := 0; i < len(pendingTools); i++ {
+		acc, ok := pendingTools[i]
+		if !ok {
+			continue
+		}
+		toolCalls = append(toolCalls, map[string]any{
+			"id":       acc.id,
+			"type":     "function",
+			"function": map[string]any{"name": acc.name, "arguments": acc.args.String()},
+		})
 	}
 
 	// 上游 200 但流内没有任何 data 事件：聚合结果为空，报错而不是返回空内容
@@ -940,6 +948,7 @@ type anthropicReq struct {
 	Tools       json.RawMessage `json:"tools,omitempty"`
 	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
 	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	SessionID   string          `json:"session_id,omitempty"`
 	Extra       map[string]any  `json:"-"`
 }
 
@@ -1014,6 +1023,9 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		"stream":     req.Stream,
 		"messages":   []any{},
 	}
+	if req.SessionID != "" {
+		openAI["session_id"] = req.SessionID
+	}
 	if req.Temperature != 0 {
 		openAI["temperature"] = req.Temperature
 	}
@@ -1028,7 +1040,28 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		}
 	}
 	if req.ToolChoice != nil {
-		openAI["tool_choice"] = req.ToolChoice
+		// Anthropic 对象形式 tool_choice 在 OpenAI 上游非法,映射为 OpenAI 格式
+		var tc map[string]any
+		if json.Unmarshal(req.ToolChoice, &tc) == nil {
+			switch tc["type"] {
+			case "auto":
+				openAI["tool_choice"] = "auto"
+			case "none":
+				openAI["tool_choice"] = "none"
+			case "any":
+				openAI["tool_choice"] = "required"
+			case "tool":
+				if n, ok := tc["name"].(string); ok && n != "" {
+					openAI["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": n}}
+				} else {
+					openAI["tool_choice"] = req.ToolChoice
+				}
+			default:
+				openAI["tool_choice"] = req.ToolChoice
+			}
+		} else {
+			openAI["tool_choice"] = req.ToolChoice
+		}
 	}
 
 	msgs := []any{}
@@ -1102,6 +1135,10 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 				msgs = append(msgs, msg)
 				log.Printf("  anthropic req: assistant tool_calls=%d", len(toolCalls))
 			} else if m.Role == "user" && len(toolResults) > 0 {
+				// Anthropic 允许 user 消息混排 text 与 tool_result,text 不能丢
+				if len(textParts) > 0 {
+					msgs = append(msgs, map[string]any{"role": "user", "content": strings.Join(textParts, "\n")})
+				}
 				for _, tr := range toolResults {
 					msgs = append(msgs, tr)
 					content, _ := tr["content"].(string)
@@ -1147,14 +1184,13 @@ func parseToolArgs(raw string) (any, error) {
 			}
 		}
 	}
-	fixed := raw
-	if strings.HasPrefix(fixed, "{") && !strings.HasSuffix(fixed, "}") {
+	// 逗号后截断:先剥尾逗号,再按开头补对应闭符(嵌套对象截断也能救回)
+	fixed := strings.TrimRight(strings.TrimSpace(raw), ",")
+	switch {
+	case strings.HasPrefix(fixed, "{") && !strings.HasSuffix(fixed, "}"):
 		fixed += "}"
-	} else if strings.HasPrefix(fixed, "[") && !strings.HasSuffix(fixed, "]") {
+	case strings.HasPrefix(fixed, "[") && !strings.HasSuffix(fixed, "]"):
 		fixed += "]"
-	}
-	if strings.HasSuffix(fixed, ",") {
-		fixed = strings.TrimRight(fixed, ",") + "}"
 	}
 	if err := json.Unmarshal([]byte(fixed), &v); err == nil && v != nil {
 		return v, nil
@@ -1260,7 +1296,7 @@ func anthropicContentToString(v any) string {
 	return ""
 }
 
-func openAIToAnthropic(openAI map[string]any) map[string]any {
+func openAIToAnthropic(openAI map[string]any, toolSchemas map[string]map[string]bool) map[string]any {
 	out := map[string]any{
 		"id":    "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
 		"type":  "message",
@@ -1320,6 +1356,10 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 					if input == nil {
 						input = map[string]any{}
 					}
+					// Anthropic 要求 input 是对象:非 map(数字/布尔/字符串/数组)置空对象,避免客户端 schema 校验失败
+					if _, ok := input.(map[string]any); !ok {
+						input = map[string]any{}
+					}
 					id, _ := tcMap["id"].(string)
 					if id == "" {
 						id = fmt.Sprintf("toolu_%x_%d", time.Now().UnixMilli(), len(contentBlocks))
@@ -1327,6 +1367,10 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 					name, _ := funcData["name"].(string)
 					if name == "" {
 						continue
+					}
+					if inputMap, ok := input.(map[string]any); ok {
+						// 与流式路径一致:按客户端声明的 schema 裁剪多余字段
+						input = filterToolInput(name, inputMap, toolSchemas)
 					}
 					block := map[string]any{
 						"type":  "tool_use",
@@ -1466,7 +1510,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 			usageFn(u)
 		}
 		out = normalizeOpenAIResponse(out)
-		anthropicResp := openAIToAnthropic(out)
+		anthropicResp := openAIToAnthropic(out, toolSchemas)
 		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 			anthropicResp["stop_reason"] = "tool_use"
 		}
@@ -1491,7 +1535,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	out = normalizeOpenAIResponse(out)
-	anthropicResp := openAIToAnthropic(out)
+	anthropicResp := openAIToAnthropic(out, toolSchemas)
 
 	if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 		anthropicResp["stop_reason"] = "tool_use"
@@ -1577,7 +1621,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		}
 	}
 	chatOut = normalizeOpenAIResponse(chatOut)
-	anthropicResp := openAIToAnthropic(chatOut)
+	anthropicResp := openAIToAnthropic(chatOut, toolSchemas)
 	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 		anthropicResp["stop_reason"] = "tool_use"
 	}
@@ -1649,8 +1693,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 	emitToolBlock := func(acc *toolAccumulator) {
 		acc.emitted = true
 		if acc.name == "" {
-			log.Printf("  tool_use missing name, skipping (id=%s)", acc.id)
-			return
+			// 畸形流(name 缺失):生成占位名照常发射,避免 stop_reason=tool_use 却无对应块导致客户端挂起
+			acc.name = fmt.Sprintf("tool_%x", time.Now().UnixMilli())
+			log.Printf("  tool_use missing name, generated %s (id=%s)", acc.name, acc.id)
 		}
 		idx := nextIndex()
 		id := acc.id

@@ -28,7 +28,7 @@ func responsesToChat(body map[string]any) map[string]any {
 	if mt, ok := body["max_output_tokens"].(float64); ok {
 		out["max_tokens"] = int(mt)
 	}
-	for _, k := range []string{"temperature", "top_p", "stop", "seed", "user", "metadata", "logit_bias"} {
+	for _, k := range []string{"temperature", "top_p", "stop", "seed", "user", "metadata", "logit_bias", "session_id"} {
 		if v, ok := body[k]; ok {
 			out[k] = v
 		}

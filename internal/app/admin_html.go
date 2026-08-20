@@ -910,7 +910,7 @@ async function loadLogs() {
         '<td class="mono" style="font-size:12px">' + esc(l.model || '-') + '</td>' +
         '<td><span class="model-tag">' + esc(route) + '</span></td>' +
         '<td style="font-weight:600;color:' + STATUS_CLASS(st) + '">' + st + '</td>' +
-        '<td class="mono" style="font-size:11px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
+        '<td class="mono" style="font-size:11px">' + (l.duration_ms != null ? l.duration_ms + ' ms' : '-') + '</td>' +
       '</tr>';
     }).join('');
   } catch (e) { tbody.innerHTML = '<tr><td colspan="8" class="empty">加载失败</td></tr>'; }
@@ -1013,7 +1013,7 @@ async function refreshModels() {
   try {
     _('modelsProbeInfo').textContent = '· 同步中...';
     const d = await api('POST', '/models/refresh');
-    toast(d.data.message || '同步已开始', 'info');
+    toast(d.message || '同步已开始', 'info');
     setTimeout(loadModels, 3000);
   } catch (e) { toast('刷新失败: ' + e.message, 'error'); _('modelsProbeInfo').textContent = ''; }
 }
@@ -1152,8 +1152,8 @@ async function loadOcStats() {
     const d = await api('GET', '/opencode/stats');
     const t = d.data.today || {}, s = d.data.total || {};
     _('ocStatsBox').innerHTML = '<table><thead><tr><th style="text-align:left"></th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>压缩消耗</th><th>限流命中</th></tr></thead><tbody>' +
-      '<tr><td style="text-align:left">今日</td><td>' + (t.requests || 0) + '</td><td>' + (t.promptTokens || 0) + '</td><td>' + (t.completionTokens || 0) + '</td><td>' + (t.compaction || 0) + '</td><td>' + (t.rateLimited || 0) + '</td></tr>' +
-      '<tr><td style="text-align:left">累计</td><td>' + (s.requests || 0) + '</td><td>' + (s.promptTokens || 0) + '</td><td>' + (s.completionTokens || 0) + '</td><td>' + (s.compaction || 0) + '</td><td>' + (s.rateLimited || 0) + '</td></tr>' +
+      '<tr><td style="text-align:left">今日</td><td>' + (t.requests || 0) + '</td><td>' + (t.promptTokens || 0) + '</td><td>' + (t.completionTokens || 0) + '</td><td>' + (t.compactionTokens || 0) + '</td><td>' + (t.rateLimited || 0) + '</td></tr>' +
+      '<tr><td style="text-align:left">累计</td><td>' + (s.requests || 0) + '</td><td>' + (s.promptTokens || 0) + '</td><td>' + (s.completionTokens || 0) + '</td><td>' + (s.compactionTokens || 0) + '</td><td>' + (s.rateLimited || 0) + '</td></tr>' +
       '</tbody></table>';
     const bm = t.byModel || {};
     const rows = Object.keys(bm).map(k => '<tr><td style="text-align:left;font-family:monospace">' + esc(k) + '</td><td>' + bm[k].requests + '</td><td>' + bm[k].promptTokens + '</td><td>' + bm[k].completionTokens + '</td></tr>').join('');

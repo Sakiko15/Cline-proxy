@@ -21,14 +21,15 @@ var (
 )
 
 type oauthSessionState struct {
-	DeviceCode string
-	UserCode   string
-	AuthURL    string
-	CreatedAt  time.Time
-	Done       bool
-	Success    bool
-	Email      string
-	Error      string
+	DeviceCode  string
+	UserCode    string
+	AuthURL     string
+	CreatedAt   time.Time
+	CompletedAt time.Time // Done 置位时间,用于惰性清理
+	Done        bool
+	Success     bool
+	Email       string
+	Error       string
 }
 
 type apiResponse struct {
@@ -226,7 +227,8 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		authURL = device.VerificationURI
 	}
 
-	sessionID := fmt.Sprintf("oauth_%d", time.Now().UnixMilli())
+	// 随机后缀:避免同一毫秒两个窗口 ID 碰撞导致状态互相覆盖
+	sessionID := "oauth_" + kit.RandHex(8)
 	state := &oauthSessionState{
 		DeviceCode: device.DeviceCode,
 		UserCode:   device.UserCode,
@@ -255,6 +257,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			state.Error = err.Error()
 			state.Done = true
 			state.Success = false
+			state.CompletedAt = time.Now()
 			oauthSessionsMu.Unlock()
 			return
 		}
@@ -265,6 +268,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			state.Error = err.Error()
 			state.Done = true
 			state.Success = false
+			state.CompletedAt = time.Now()
 			oauthSessionsMu.Unlock()
 			return
 		}
@@ -289,6 +293,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		state.Done = true
 		state.Success = true
 		state.Email = email
+		state.CompletedAt = time.Now()
 		oauthSessionsMu.Unlock()
 		log.Printf("OAuth account added: %s", email)
 	}()
@@ -313,25 +318,33 @@ func handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 
 	oauthSessionsMu.Lock()
 	state, ok := oauthSessions[sessionID]
-	oauthSessionsMu.Unlock()
-
-	if !ok {
-		writeAPI(w, http.StatusNotFound, apiResponse{Error: "session not found"})
-		return
-	}
-
-	resp := map[string]any{
-		"done":    state.Done,
-		"success": state.Success,
-	}
-	if state.Done {
-		resp["email"] = state.Email
-		if !state.Success {
-			resp["error"] = state.Error
+	if ok {
+		// 惰性清理:完成后超过 5 分钟的 session 移除,防内存无限增长
+		if state.Done && !state.CompletedAt.IsZero() && time.Since(state.CompletedAt) > 5*time.Minute {
+			delete(oauthSessions, sessionID)
+			ok = false
 		}
 	}
-
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: resp})
+	if ok {
+		// 锁内快照字段,避免与后台轮询协程的写入竞争
+		done, success, email, errMsg := state.Done, state.Success, state.Email, state.Error
+		oauthSessionsMu.Unlock()
+		resp := map[string]any{
+			"done":    done,
+			"success": success,
+		}
+		if done {
+			resp["email"] = email
+			if !success {
+				resp["error"] = errMsg
+			}
+		}
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: resp})
+		return
+	}
+	oauthSessionsMu.Unlock()
+	writeAPI(w, http.StatusNotFound, apiResponse{Error: "session not found"})
+	return
 }
 
 // POST /admin/api/sso/import  body: { ssoCookies: string, email?: string }
@@ -512,7 +525,9 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	poolMu.Lock()
-	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
+	// 只清账号:API Keys 与默认模型与账号生命周期无关,误删会导致全部客户端 401
+	p := pool
+	pool = &AccountPool{Accounts: []*Account{}, Keys: p.Keys, DefaultModel: p.DefaultModel}
 	poolMu.Unlock()
 	savePool()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "All accounts deleted"})
@@ -1008,7 +1023,8 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p := loadPool()
+	poolMu.Lock()
+	p := pool
 	active, cooldown, expired := 0, 0, 0
 	for _, a := range p.Accounts {
 		switch a.Status {
@@ -1020,6 +1036,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			expired++
 		}
 	}
+	poolMu.Unlock()
 
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
@@ -1028,7 +1045,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"active":   active,
 			"cooldown": cooldown,
 			"expired":  expired,
-			"strategy": "round_robin",
+			"strategy": getProxyConfig().Strategy,
 			"version":  "go-1.1",
 		},
 	})
@@ -1040,7 +1057,8 @@ func handleAccountsExport(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	p := loadPool()
+	poolMu.Lock()
+	p := pool
 	items := make([]map[string]any, 0, len(p.Accounts))
 	for _, a := range p.Accounts {
 		items = append(items, map[string]any{
@@ -1048,6 +1066,7 @@ func handleAccountsExport(w http.ResponseWriter, r *http.Request) {
 			"email":        a.Email,
 		})
 	}
+	poolMu.Unlock()
 	data, _ := json.MarshalIndent(items, "", "  ")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="cline-accounts-export.json"`)

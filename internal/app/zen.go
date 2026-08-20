@@ -198,6 +198,7 @@ var (
 	zenSem       chan struct{} // 并发信号量
 	zenFailCount int           // 连续失败计数
 	zenFailUntil time.Time     // 故障转移截止时间
+	zenLastFail  time.Time     // 最近一次失败时间(计数窗口衰减用)
 	zenStateMu   sync.Mutex
 )
 
@@ -220,6 +221,7 @@ func markZenSuccess() {
 	zenStateMu.Lock()
 	zenFailCount = 0
 	zenFailUntil = time.Time{}
+	zenLastFail = time.Time{}
 	zenStateMu.Unlock()
 }
 
@@ -234,9 +236,15 @@ func markZenFail() {
 		window = 5
 	}
 	zenStateMu.Lock()
+	now := time.Now()
+	// 失败间隔超过窗口则视为新的失败序列,计数衰减:稀疏失败不会跨小时累积触发
+	if !zenLastFail.IsZero() && now.Sub(zenLastFail) > time.Duration(window)*time.Minute {
+		zenFailCount = 0
+	}
+	zenLastFail = now
 	zenFailCount++
 	if zenFailCount >= thr {
-		zenFailUntil = time.Now().Add(time.Duration(window) * time.Minute)
+		zenFailUntil = now.Add(time.Duration(window) * time.Minute)
 	}
 	zenStateMu.Unlock()
 }
@@ -417,13 +425,15 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 
 		resp, err := getZenHTTPClient().Do(req)
 		if err != nil {
-			// 网络错误:退避重试(不计入故障转移,瞬时可恢复)
+			// 网络错误:退避重试;重试耗尽仍失败则计入故障转移
+			// (否则 zen 整体不可达时故障转移永不激活,免费请求一直 502)
 			if attempt < retries {
 				log.Printf("  zen network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
 				time.Sleep(kit.WithRetryJitter(delay))
 				delay *= 2
 				continue
 			}
+			markZenFail()
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
@@ -437,8 +447,8 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
 			rateLimited++
-			// 冷却当前出口代理
-			if idx := lastZenProxyIdx(); idx >= 0 {
+			// 冷却实际使用的出口代理(zenDialContext 记录的真实拨号索引)
+			if idx := lastZenDialProxyIdx(); idx >= 0 {
 				d := parseRetryAfter(resp.Header.Get("Retry-After"))
 				if d <= 0 {
 					d = 10 * time.Minute
@@ -460,7 +470,10 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 			return nil, rateLimited, fmt.Errorf("%s", reason)
 		}
 
-		markZenFail()
+		// 4xx(401 key 错/400 非法请求体/404)是本代理或客户端的问题,不计入 zen 服务故障
+		if resp.StatusCode >= 500 {
+			markZenFail()
+		}
 		return nil, rateLimited, fmt.Errorf("%s", reason)
 	}
 }
@@ -471,7 +484,7 @@ func describeZenProxy() string {
 	if len(proxies) == 0 {
 		return "direct"
 	}
-	idx := lastZenProxyIdx()
+	idx := lastZenDialProxyIdx()
 	if idx < 0 {
 		idx = 0
 	}
