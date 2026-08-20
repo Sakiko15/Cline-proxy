@@ -23,6 +23,8 @@ var proxyListenAddress = "0.0.0.0:3457"
 const (
 	defaultMaxTokens       = 128000
 	defaultReasoningEffort = "high"
+	// 推理模型 max_tokens 下限:预算过小会被推理耗尽,content 恒空(deepseek-v4-flash 实测)
+	minReasoningTokens = 8192
 )
 
 var passThroughKeys = []string{
@@ -464,6 +466,13 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 		model = normalizeRequestModel(m)
 	}
 
+	// 推理模型(RequiresStream 标记)输出预算大部分被推理消耗:
+	// max_tokens 过小时推理耗尽全部预算,content 恒空,客户端"没有回复内容"(deepseek-v4-flash 实测 reasoning 65/68 token)
+	if modelNeedsStream(model) && maxTokens < minReasoningTokens {
+		log.Printf("  model %s max_tokens=%d below reasoning floor, raising to %d", model, maxTokens, minReasoningTokens)
+		maxTokens = minReasoningTokens
+	}
+
 	body := map[string]any{
 		"model":            model,
 		"max_tokens":       maxTokens,
@@ -802,6 +811,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	var (
 		model        string
 		content      strings.Builder
+		reasoning    strings.Builder // 推理内容(content 空时兜底给客户端显示)
 		finishReason string
 		usage        map[string]any
 		toolCalls    []any
@@ -861,6 +871,13 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 			if c, ok := delta["content"].(string); ok && c != "" {
 				content.WriteString(c)
 			}
+			// 累积推理内容:上游用 reasoning/reasoning_content 字段(deepseek-v4-flash 等推理模型),
+			// content 空时兜底给客户端显示,避免"没有回复内容"
+			if r, ok := delta["reasoning"].(string); ok && r != "" {
+				reasoning.WriteString(r)
+			} else if r, ok := delta["reasoning_content"].(string); ok && r != "" {
+				reasoning.WriteString(r)
+			}
 			if tcRaw, ok := delta["tool_calls"].([]any); ok {
 				for _, tc := range tcRaw {
 					tcMap, _ := tc.(map[string]any)
@@ -919,6 +936,10 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	message := map[string]any{
 		"role":    "assistant",
 		"content": content.String(),
+	}
+	// content 空但推理非空:推理内容放 reasoning_content(OpenAI 兼容扩展字段)兜底,客户端不至于空白
+	if content.Len() == 0 && reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
