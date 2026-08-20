@@ -1,0 +1,18 @@
+# 构建上下文瘦身与敏感信息防护:
+# 无此文件时 COPY . .(Dockerfile:6) 会把 .git 全历史拷进镜像,
+# 且本地 data/ 中的账号文件(.cline-accounts.json 含 refreshToken 明文)会一并进入镜像
+.git
+.github
+data
+dist
+docs
+*.log
+*.exe
+cline-proxy
+cline-proxy-*
+override.md
+.cline-*
+.zen-config.json
+*.jsonl
+capture.go
+capture-logs
