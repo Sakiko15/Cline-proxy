@@ -59,6 +59,8 @@ docker compose down
 
 数据持久化在 `./data/` 目录下，`override.md` 会自动从项目根目录挂载到容器内。
 
+1Panel 编排（Compose）一键部署见 [docs/1panel-deploy.md](docs/1panel-deploy.md)。
+
 ## 使用指南
 
 ### 1. 添加 Cline 账号

@@ -12,3 +12,4 @@ services:
       - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457
+      - TZ=Asia/Shanghai
