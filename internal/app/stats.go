@@ -165,7 +165,10 @@ func recordZenStats(rec zenStatsRecord) {
 	if statsFile != nil {
 		b, err := json.Marshal(rec)
 		if err == nil {
-			statsFile.Write(append(b, '\n'))
+			if _, werr := statsFile.Write(append(b, '\n')); werr != nil {
+				// 磁盘满/IO 错误:不再静默丢统计
+				log.Printf("zen stats write failed: %v", werr)
+			}
 		}
 	}
 	statsFileMu.Unlock()

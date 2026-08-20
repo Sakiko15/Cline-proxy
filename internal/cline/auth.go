@@ -60,10 +60,7 @@ type clineRefreshResp struct {
 }
 
 var (
-	cachedToken      string
-	cachedExpiry     int64
-	cachedRefreshTok string
-	credentialsPath  string
+	credentialsPath string
 )
 
 func init() {
@@ -95,18 +92,6 @@ func FindCredentialsFile() string {
 	return filepath.Join(pwd, ".cline-credentials.json")
 }
 
-
-func LoadCredentials() *credentials {
-	data, err := os.ReadFile(credentialsPath)
-	if err != nil {
-		return nil
-	}
-	var c credentials
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil
-	}
-	return &c
-}
 
 func SaveCredentials(rt string) {
 	c := credentials{RefreshToken: rt}
@@ -238,29 +223,6 @@ func RefreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	return &c, nil
 }
 
-func GetToken() (string, error) {
-	if cachedToken != "" && time.Now().UnixMilli() < cachedExpiry {
-		return cachedToken, nil
-	}
-
-	creds := LoadCredentials()
-	if creds != nil && creds.RefreshToken != "" {
-		resp, err := RefreshClineToken(creds.RefreshToken)
-		if err == nil && resp.Data.AccessToken != "" {
-			cachedToken = "workos:" + resp.Data.AccessToken
-			cachedRefreshTok = resp.Data.RefreshToken
-			if cachedRefreshTok == "" {
-				cachedRefreshTok = creds.RefreshToken
-			}
-			cachedExpiry = ParseExpiry(resp.Data.ExpiresAt) - 60000
-			SaveCredentials(cachedRefreshTok)
-			return cachedToken, nil
-		}
-		log.Printf("Token refresh failed: %v", err)
-	}
-	return "", fmt.Errorf("no valid credentials. Run with --login flag first")
-}
-
 func ParseExpiry(exp any) int64 {
 	switch v := exp.(type) {
 	case float64:
@@ -331,9 +293,6 @@ func DoLogin() error {
 	}
 
 	SaveCredentials(reg.Data.RefreshToken)
-	cachedToken = "workos:" + reg.Data.AccessToken
-	cachedRefreshTok = reg.Data.RefreshToken
-	cachedExpiry = ParseExpiry(reg.Data.ExpiresAt) - 60000
 
 	email := "unknown"
 	if reg.Data.UserInfo != nil && reg.Data.UserInfo.Email != "" {

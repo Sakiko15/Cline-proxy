@@ -53,7 +53,10 @@ func loadPool() *AccountPool {
 	}
 	pool = &p
 	if pool.DefaultModel != "" {
+		// defaultModel 的读方(getDefaultModel)在 modelsMu 内,写入同步加锁
+		modelsMu.Lock()
 		defaultModel = pool.DefaultModel
+		modelsMu.Unlock()
 	}
 	return pool
 }
@@ -67,9 +70,11 @@ func setDefaultModel(modelID string) {
 	if !ok {
 		return
 	}
-	defaultModel = modelID
 	p := loadPool()
 	poolMu.Lock()
+	modelsMu.Lock()
+	defaultModel = modelID
+	modelsMu.Unlock()
 	p.DefaultModel = modelID
 	poolMu.Unlock()
 	savePool()

@@ -522,8 +522,8 @@ func syncZenModels() (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Key)
-	client := &http.Client{Timeout: 25 * time.Second}
-	resp, err := client.Do(req)
+	// 与数据请求一致:走代理池 + uTLS 指纹(直连在需要代理访问上游时同步必失败)
+	resp, err := getZenHTTPClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -571,8 +571,11 @@ func syncZenModels() (int, error) {
 // startZenModelsRefresher 定时同步 zen 模型列表(默认 10 分钟)
 func startZenModelsRefresher() {
 	go func() {
-		if _, err := syncZenModels(); err != nil {
-			log.Printf("zen model sync: failed (%v), using seed list", err)
+		// 首轮与 ticker 分支一致:zen 禁用时不发起同步
+		if cfg := getZenConfig(); cfg.Enabled {
+			if _, err := syncZenModels(); err != nil {
+				log.Printf("zen model sync: failed (%v), using seed list", err)
+			}
 		}
 		ticker := time.NewTicker(10 * time.Minute)
 		for range ticker.C {

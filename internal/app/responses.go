@@ -188,7 +188,7 @@ func chatToResponses(chat map[string]any) map[string]any {
 			outputs = append(outputs, msgOut)
 
 			if tc, ok := msg["tool_calls"].([]any); ok {
-				for _, c := range tc {
+				for i, c := range tc {
 					if cm, ok := c.(map[string]any); ok {
 						fn, _ := cm["function"].(map[string]any)
 						callID, _ := cm["id"].(string)
@@ -205,7 +205,8 @@ func chatToResponses(chat map[string]any) map[string]any {
 						}
 						outputs = append(outputs, map[string]any{
 							"type":      "function_call",
-							"id":        "fc_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+							// 带 index:同一毫秒多个工具调用时 id 仍唯一
+							"id":        "fc_" + fmt.Sprintf("%x_%d", time.Now().UnixNano(), i),
 							"call_id":   callID,
 							"name":      name,
 							"arguments": args,
@@ -280,6 +281,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 
 	textEmitted := false
 	var outText strings.Builder
+	var respUsage map[string]any // 上游 usage,response.completed 回传
 	// 并行工具调用按 index 分别累积,避免多 index 交错时参数互相拼接
 	type respToolAcc struct {
 		callID string
@@ -315,6 +317,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)
 					}
+				}
+				if u, ok := obj["usage"].(map[string]any); ok {
+					respUsage = u
 				}
 				choices, _ := obj["choices"].([]any)
 				if len(choices) == 0 {
@@ -433,6 +438,29 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": itemID, "output_index": idx + 1, "arguments": argsStr})
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": idx + 1, "item": map[string]any{"type": "function_call", "id": itemID, "call_id": acc.callID, "name": acc.name, "arguments": argsStr, "status": "completed"}})
 	}
+	// response.completed 携带完整终态:依赖终态事件的客户端(而非增量重建)拿到真实 output 与 usage
+	outputItems := []any{}
+	if textEmitted {
+		outputItems = append(outputItems, map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}})
+	}
+	for idx := 0; idx < len(pendingTools); idx++ {
+		acc, ok := pendingTools[idx]
+		if !ok || !acc.added {
+			continue
+		}
+		outputItems = append(outputItems, map[string]any{"type": "function_call", "id": fmt.Sprintf("fc_%s_%d", s.respID, idx), "call_id": acc.callID, "name": acc.name, "arguments": acc.args.String(), "status": "completed"})
+	}
+	usageOut := map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+	if respUsage != nil {
+		var pt, ct float64
+		if v, ok := respUsage["prompt_tokens"].(float64); ok {
+			pt = v
+		}
+		if v, ok := respUsage["completion_tokens"].(float64); ok {
+			ct = v
+		}
+		usageOut = map[string]any{"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}
+	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
@@ -441,9 +469,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"created_at":  time.Now().Unix(),
 			"status":      "completed",
 			"model":       model,
-			"output":      []any{},
+			"output":      outputItems,
 			"output_text": outText.String(),
-			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+			"usage":       usageOut,
 		},
 	})
 }

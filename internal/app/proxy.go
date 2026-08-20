@@ -1663,6 +1663,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 
 	msgID := "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli())
 	stopReason := "end_turn"
+	var streamUsage map[string]any // 上游 usage,message_delta 回传客户端
 	emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -1755,6 +1756,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 				onUsage(u)
 			}
+		}
+		if u, ok := obj["usage"].(map[string]any); ok {
+			streamUsage = u
 		}
 		if data, ok := obj["data"]; ok {
 			if d, ok := data.(map[string]any); ok {
@@ -1876,15 +1880,23 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		}
 	}
 
+	// message_delta 的 usage 用上游真实值(否则 Cline 界面 token 计数恒 0)
+	usageMap := map[string]any{"output_tokens": 0}
+	if streamUsage != nil {
+		if ot, ok := streamUsage["completion_tokens"]; ok && ot != nil {
+			usageMap["output_tokens"] = ot
+		}
+		if it, ok := streamUsage["prompt_tokens"]; ok && it != nil {
+			usageMap["input_tokens"] = it
+		}
+	}
 	emit("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{
-			"output_tokens": 0,
-		},
+		"usage": usageMap,
 	})
 
 	emit("message_stop", map[string]any{"type": "message_stop"})

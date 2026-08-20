@@ -162,6 +162,26 @@ func syncRecommendedModels() (int, error) {
 		added++
 	}
 
+	// 清理下架模型:同步成功后,删除不在新列表且非种子的模型
+	// (否则上游下架模型永久留在列表并被 normalizeRequestModel 接受)
+	inFeed := make(map[string]bool, len(payload.Free))
+	for _, m := range payload.Free {
+		inFeed[m.ID] = true
+	}
+	for _, s := range seedModelCandidates() {
+		inFeed[s.ID] = true
+	}
+	removed := 0
+	for id := range modelsCache {
+		if !inFeed[id] {
+			delete(modelsCache, id)
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("  model sync: removed %d models no longer in upstream feed", removed)
+	}
+
 	modelsLastSync = time.Now()
 	return added, nil
 }

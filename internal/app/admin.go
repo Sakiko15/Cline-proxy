@@ -858,7 +858,8 @@ func handleAdminGenerateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	key := fmt.Sprintf("cline_%x_%x", time.Now().UnixMilli(), time.Now().UnixNano()%1000000)
+	// crypto/rand 32 hex:原 cline_<ms>_<ns%1e6> 熵仅 ~100 万种且时间戳可预测,可被离线枚举
+	key := "cline_" + kit.RandHex(16)
 	p := loadPool()
 	poolMu.Lock()
 	p.Keys = append(p.Keys, key)
