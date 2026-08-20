@@ -665,7 +665,13 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	}
 
 	reader := bufio.NewReader(upstream.Body)
-	sawData := false
+	sawData := false   // 是否见过 data: 行(防全空流)
+	sawContent := false // 是否见过非空 content/tool_calls(防"全思考无回答"透传成空白)
+	emitEmptyErr := func(msg string) {
+		w.Write([]byte(`data: {"error":{"message":"` + msg + `","type":"api_error"}}` + "\n\n"))
+		flusher.Flush()
+		log.Printf("  upstream returned empty response (%s), synthesized error event to client", msg)
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -688,6 +694,10 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			sawData = true
 			payload := strings.TrimSpace(line[5:])
 			if payload == "" || payload == "[DONE]" {
+				// 流正常结束但从未输出实际内容(deepseek 等推理模型偶发全 reasoning 无 content)
+				if !sawContent {
+					emitEmptyErr("upstream returned empty content")
+				}
 				w.Write([]byte(line + "\n\n"))
 				flusher.Flush()
 				continue
@@ -713,6 +723,12 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 					}
 				}
 				normalized := normalizeOpenAIResponse(obj)
+				if c, ok := getNested(normalized, "choices", 0, "delta", "content").(string); ok && c != "" {
+					sawContent = true
+				}
+				if tc, ok := getNested(normalized, "choices", 0, "delta", "tool_calls").([]any); ok && len(tc) > 0 {
+					sawContent = true
+				}
 				if normBytes, err := json.Marshal(normalized); err == nil {
 					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
 					flusher.Flush()
@@ -728,9 +744,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	// 上游 200 但流内没有任何 data 事件：客户端会收到空 body。
 	// 已无法改状态码（200 头已发出），补一条 SSE 错误事件让客户端可感知/重试。
 	if !sawData {
-		w.Write([]byte("data: {\"error\":{\"message\":\"upstream returned empty stream\",\"type\":\"api_error\"}}\n\n"))
-		flusher.Flush()
-		log.Printf("  upstream returned 200 with empty stream, synthesized error event to client")
+		emitEmptyErr("upstream returned empty stream")
 	}
 }
 
@@ -765,6 +779,13 @@ func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Resp
 		log.Printf("  nonstream finish=%v tool_calls=%d content_len=%d",
 			getNested(out, "choices", 0, "finish_reason"),
 			len(tc), len(content))
+		// 上游 200 但内容为空(推理模型偶发全 reasoning 无 content):明确报错而非静默空白
+		if content == "" && len(tc) == 0 {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": map[string]string{"message": "upstream returned empty content", "type": "api_error"},
+			})
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, out)
@@ -889,6 +910,10 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	// 上游 200 但流内没有任何 data 事件：聚合结果为空，报错而不是返回空内容
 	if !sawData {
 		return nil, fmt.Errorf("upstream returned empty stream (no data events)")
+	}
+	// 有流但零实际内容(推理模型全 reasoning 无 content):同样报错
+	if content.String() == "" && len(toolCalls) == 0 {
+		return nil, fmt.Errorf("upstream returned empty content (no text or tool calls)")
 	}
 
 	message := map[string]any{
@@ -1883,6 +1908,14 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		if !acc.emitted {
 			emitToolBlock(acc)
 		}
+	}
+
+	// 流结束但从未输出任何文本/工具(推理模型全 reasoning 无 content):明确报错而非静默空白
+	if !hasText && len(pendingTools) == 0 {
+		emit("error", map[string]any{"type": "error", "error": map[string]any{
+			"type":    "api_error",
+			"message": "upstream returned empty content",
+		}})
 	}
 
 	// message_delta 的 usage 用上游真实值(否则 Cline 界面 token 计数恒 0)
