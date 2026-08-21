@@ -253,12 +253,15 @@ func StartProxy(host string, port int) error {
 		}
 
 		if upstreamStream {
-			out, err := collectStreamResponse(resp)
+			out, acc2, err := collectStreamWithRetry(params, resp)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
 				return
+			}
+			if acc2 != nil {
+				usageFn = accountUsageFn(acc2, params)
 			}
 			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
 				usageFn(u)
@@ -929,7 +932,8 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		return nil, fmt.Errorf("upstream returned empty stream (no data events)")
 	}
 	// 有流但零实际内容(推理模型全 reasoning 无 content):同样报错
-	if content.String() == "" && len(toolCalls) == 0 {
+	// 注:content 空但 reasoning 非空时不报错——下方兜底为 reasoning_content 返回给客户端显示
+	if content.String() == "" && len(toolCalls) == 0 && reasoning.Len() == 0 {
 		return nil, fmt.Errorf("upstream returned empty content (no text or tool calls)")
 	}
 
@@ -960,6 +964,28 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		out["usage"] = usage
 	}
 	return out, nil
+}
+
+// collectStreamWithRetry 非流式聚合 + 空内容重试:
+// 上游多 provider 后端偶发 200 + 全空流(deepseek-v4-flash 实测 OpenInference/Decart/DeepInfra 轮换),
+// 重试一次换账号/provider,仍空才报错。
+// 返回 acc2:重试发生时为新账号(usage 记账归属),未重试时为 nil(调用方沿用原 acc)。
+func collectStreamWithRetry(params map[string]any, resp *http.Response) (map[string]any, *Account, error) {
+	out, err := collectStreamResponse(resp)
+	if err == nil || !strings.Contains(err.Error(), "empty content") {
+		return out, nil, err
+	}
+	log.Printf("  upstream returned empty content, retrying once")
+	resp2, acc2, err := callClineAPI(params, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp2.Body.Close()
+	out2, err := collectStreamResponse(resp2)
+	if err != nil {
+		return nil, acc2, err
+	}
+	return out2, acc2, nil
 }
 
 func modelNeedsStream(modelID string) bool {
@@ -1550,12 +1576,15 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if upstreamStream {
-		out, err := collectStreamResponse(resp)
+		out, acc2, err := collectStreamWithRetry(openAIReq, resp)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
 			return
+		}
+		if acc2 != nil {
+			usageFn = accountUsageFn(acc2, openAIReq)
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
 			usageFn(u)

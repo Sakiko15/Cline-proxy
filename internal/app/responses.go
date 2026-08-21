@@ -570,10 +570,13 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stream {
-		out, err := collectStreamResponse(up)
+		out, acc2, err := collectStreamWithRetry(chat, up)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
+		}
+		if acc2 != nil {
+			usageFn = accountUsageFn(acc2, chat)
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
 			usageFn(u)
